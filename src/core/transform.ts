@@ -684,6 +684,13 @@ export interface TransformInfo {
   /** Approx size (chars) of that cached prefix — pairs with cachePrefixSha8 so a
    *  bust reads as growth (size up) vs pure invalidation (size unchanged). */
   cachePrefixBytes?: number;
+  /** Per-layer digests of that same pinned prefix, in wire order: tool
+   *  definitions, system blocks, and the imaged head (messages up to and
+   *  including the history/slab boundary). Exactly one of these moving names
+   *  the cache-bust culprit; the aggregate cachePrefixSha8 alone cannot. */
+  cachePrefixToolsSha8?: string;
+  cachePrefixSystemSha8?: string;
+  cachePrefixHeadSha8?: string;
   /** Why the history collapse didn't run (or did). Diagnostic only. */
   historyReason?:
     | 'no_history'
@@ -1016,13 +1023,27 @@ async function recordRecoverable(
   });
 }
 
-/** Hash the concatenated base64 of every image block on `messages[0]` (the synthetic
- *  history message). Stable across the quantized collapse window → proves Anthropic
- *  can cache_read the history prefix. Returns undefined if no images on messages[0]. */
+/** Hash the concatenated base64 of every image block on the synthetic history
+ *  message. Stable across the quantized collapse window → proves Anthropic can
+ *  cache_read the history prefix. Returns undefined if there is no such message.
+ *
+ *  The synthetic message is NOT `messages[0]` whenever a slab anchor exists:
+ *  collapseHistory returns `[...head, syntheticUser, ...tail]` and transform.ts
+ *  passes `protectedPrefix = slabAnchorIdx + 1`, so on a Claude Code request
+ *  `messages[0]` is the protected slab message. Hashing it reported SLAB image
+ *  stability under the `history_image_sha8` name — the one field meant to prove
+ *  history-image byte-identity was blind to the history images, so a drifting
+ *  collapse boundary still looked stable in telemetry (#11 attribution). Locate
+ *  the message by its banner instead, exactly like cachePrefixDigest does. */
 async function historyImageSha8(
   messages: Message[],
 ): Promise<string | undefined> {
-  const synthetic = messages[0];
+  const synthetic = messages.find(
+    (m) =>
+      Array.isArray(m.content) &&
+      (m.content[0] as TextBlock | undefined)?.type === 'text' &&
+      (m.content[0] as TextBlock).text === HISTORY_SYNTHETIC_INTRO,
+  );
   if (!synthetic || !Array.isArray(synthetic.content)) return undefined;
   let concat = '';
   for (const blk of synthetic.content) {
@@ -1110,7 +1131,10 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
  */
 async function cachePrefixDigest(
   req: { tools?: unknown; system?: unknown; messages?: unknown },
-): Promise<{ sha8: string; bytes: number } | undefined> {
+): Promise<
+  | { sha8: string; bytes: number; toolsSha8: string; systemSha8: string; headSha8: string }
+  | undefined
+> {
   const msgs = Array.isArray(req.messages) ? (req.messages as Message[]) : [];
   // Boundary = latest message carrying pxpipe's imaged prefix: the history image
   // (banner) when collapse ran, else the slab message ('[End of rendered
@@ -1127,19 +1151,34 @@ async function cachePrefixDigest(
     if (isHistory || hasSlab) boundary = i;
   }
   if (boundary < 0) return undefined; // not an imaged-prefix shape — nothing pinned
-  const parts: string[] = [];
-  if (Array.isArray(req.tools)) for (const t of req.tools) parts.push(JSON.stringify(t));
+  // Component digests, in wire order. A whole-prefix hash proves THAT the cache
+  // busted but never WHICH layer moved, and the layers fail for different
+  // reasons: tools drift when the client loads a deferred tool, system drifts
+  // when volatile text (env/git status) rides inside the pinned span, and the
+  // imaged head drifts when a collapse boundary or marker placement moves.
+  // Hashing each separately turns "prefix changed" into a one-line diagnosis.
+  const toolParts: string[] = [];
+  if (Array.isArray(req.tools)) for (const t of req.tools) toolParts.push(JSON.stringify(t));
+  const sysParts: string[] = [];
   const sys = req.system;
-  if (typeof sys === 'string') parts.push(sys);
-  else if (Array.isArray(sys)) for (const b of sys) parts.push(JSON.stringify(b));
+  if (typeof sys === 'string') sysParts.push(sys);
+  else if (Array.isArray(sys)) for (const b of sys) sysParts.push(JSON.stringify(b));
+  const headParts: string[] = [];
   for (let i = 0; i <= boundary; i++) {
     const content = msgs[i]?.content;
-    if (typeof content === 'string') parts.push(content);
+    if (typeof content === 'string') headParts.push(content);
     else if (Array.isArray(content))
-      for (const b of content) parts.push(typeof b === 'string' ? b : JSON.stringify(b));
+      for (const b of content) headParts.push(typeof b === 'string' ? b : JSON.stringify(b));
   }
+  const parts = [...toolParts, ...sysParts, ...headParts];
   const prefix = parts.join('\x00');
-  return { sha8: await sha8(prefix), bytes: prefix.length };
+  return {
+    sha8: await sha8(prefix),
+    bytes: prefix.length,
+    toolsSha8: await sha8(toolParts.join('\x00')),
+    systemSha8: await sha8(sysParts.join('\x00')),
+    headSha8: await sha8(headParts.join('\x00')),
+  };
 }
 
 // Removed: extractClaudeMdSlab(). It scanned the static system text for
@@ -2398,6 +2437,9 @@ export async function transformRequest(
     if (pfx) {
       info.cachePrefixSha8 = pfx.sha8;
       info.cachePrefixBytes = pfx.bytes;
+      info.cachePrefixToolsSha8 = pfx.toolsSha8;
+      info.cachePrefixSystemSha8 = pfx.systemSha8;
+      info.cachePrefixHeadSha8 = pfx.headSha8;
     }
   }
   // Top dropped codepoints, capped at 20 entries to bound JSONL row size.

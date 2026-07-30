@@ -98,6 +98,13 @@ export interface TrackEvent {
   cache_prefix_sha8?: string;
   /** Approx chars in that pinned prefix (growth vs pure-invalidation split). */
   cache_prefix_bytes?: number;
+  /** Per-layer digests of the same pinned prefix. Whichever one moves between
+   *  two turns of a session IS the cache-bust cause: tools (client loaded a
+   *  deferred tool), system (volatile text inside the pinned span), head
+   *  (collapse boundary / marker placement moved). */
+  cache_prefix_tools_sha8?: string;
+  cache_prefix_system_sha8?: string;
+  cache_prefix_head_sha8?: string;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -278,6 +285,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.cachePrefixSha8) out.cache_prefix_sha8 = info.cachePrefixSha8;
     if (info.cachePrefixBytes !== undefined) out.cache_prefix_bytes = info.cachePrefixBytes;
+    if (info.cachePrefixToolsSha8) out.cache_prefix_tools_sha8 = info.cachePrefixToolsSha8;
+    if (info.cachePrefixSystemSha8) out.cache_prefix_system_sha8 = info.cachePrefixSystemSha8;
+    if (info.cachePrefixHeadSha8) out.cache_prefix_head_sha8 = info.cachePrefixHeadSha8;
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.churningStaticTags && info.churningStaticTags.length > 0)
