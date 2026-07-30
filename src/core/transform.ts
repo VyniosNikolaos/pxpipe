@@ -691,6 +691,16 @@ export interface TransformInfo {
   cachePrefixToolsSha8?: string;
   cachePrefixSystemSha8?: string;
   cachePrefixHeadSha8?: string;
+  /** Digest of the span Anthropic actually caches: everything up to and
+   *  including the LAST cache_control marker. After a collapse this is a strict
+   *  subset of the boundary-scoped prefix — the newest freeze chunk re-renders
+   *  every turn by design and sits after the marker — so THIS is the digest that
+   *  must stay stable turn over turn, and the boundary one is context. */
+  cachePrefixMarkedSha8?: string;
+  cachePrefixMarkedBytes?: number;
+  /** Where that last marker sits, as `m<messageIdx>.b<blockIdx>`. A marker that
+   *  roams between turns re-cuts the cached span and busts it on its own. */
+  cachePrefixMarkerPos?: string;
   /** Why the history collapse didn't run (or did). Diagnostic only. */
   historyReason?:
     | 'no_history'
@@ -1132,7 +1142,16 @@ function relocateAnchorToHistoryImage(messages: Message[] | undefined, anchorOrd
 async function cachePrefixDigest(
   req: { tools?: unknown; system?: unknown; messages?: unknown },
 ): Promise<
-  | { sha8: string; bytes: number; toolsSha8: string; systemSha8: string; headSha8: string }
+  | {
+      sha8: string;
+      bytes: number;
+      toolsSha8: string;
+      systemSha8: string;
+      headSha8: string;
+      markedSha8: string;
+      markedBytes: number;
+      markerPos: string;
+    }
   | undefined
 > {
   const msgs = Array.isArray(req.messages) ? (req.messages as Message[]) : [];
@@ -1170,6 +1189,39 @@ async function cachePrefixDigest(
     else if (Array.isArray(content))
       for (const b of content) headParts.push(typeof b === 'string' ? b : JSON.stringify(b));
   }
+  // The span Anthropic actually caches ends at the LAST cache_control marker —
+  // not at the message boundary above. Those differ by construction after a
+  // collapse: the synthetic message's newest freeze chunk re-renders every turn
+  // BY DESIGN and sits AFTER the pinned marker, so the boundary-scoped digest
+  // reports a bust on every single turn even when the cached span is perfectly
+  // stable. Digest the marker-scoped span too, and record where the marker sits:
+  // a moving marker is itself a bust cause, and telemetry could not see it.
+  let markPos = '';
+  const markedParts: string[] = [...toolParts, ...sysParts];
+  const markedUpTo: string[] = [];
+  outer: for (let i = msgs.length - 1; i >= 0; i--) {
+    const content = msgs[i]?.content;
+    if (!Array.isArray(content)) continue;
+    for (let k = content.length - 1; k >= 0; k--) {
+      const b = content[k] as { cache_control?: unknown } | undefined;
+      if (b && typeof b === 'object' && b.cache_control !== undefined) {
+        markPos = `m${i}.b${k}`;
+        for (let mi = 0; mi <= i; mi++) {
+          const c = msgs[mi]?.content;
+          if (typeof c === 'string') markedUpTo.push(c);
+          else if (Array.isArray(c))
+            for (let bk = 0; bk < c.length; bk++) {
+              if (mi === i && bk > k) break;
+              const blk = c[bk];
+              markedUpTo.push(typeof blk === 'string' ? blk : JSON.stringify(blk));
+            }
+        }
+        break outer;
+      }
+    }
+  }
+  markedParts.push(...markedUpTo);
+  const marked = markedParts.join('\x00');
   const parts = [...toolParts, ...sysParts, ...headParts];
   const prefix = parts.join('\x00');
   return {
@@ -1178,6 +1230,9 @@ async function cachePrefixDigest(
     toolsSha8: await sha8(toolParts.join('\x00')),
     systemSha8: await sha8(sysParts.join('\x00')),
     headSha8: await sha8(headParts.join('\x00')),
+    markedSha8: await sha8(marked),
+    markedBytes: marked.length,
+    markerPos: markPos,
   };
 }
 
@@ -2440,6 +2495,9 @@ export async function transformRequest(
       info.cachePrefixToolsSha8 = pfx.toolsSha8;
       info.cachePrefixSystemSha8 = pfx.systemSha8;
       info.cachePrefixHeadSha8 = pfx.headSha8;
+      info.cachePrefixMarkedSha8 = pfx.markedSha8;
+      info.cachePrefixMarkedBytes = pfx.markedBytes;
+      if (pfx.markerPos) info.cachePrefixMarkerPos = pfx.markerPos;
     }
   }
   // Top dropped codepoints, capped at 20 entries to bound JSONL row size.

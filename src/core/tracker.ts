@@ -105,6 +105,12 @@ export interface TrackEvent {
   cache_prefix_tools_sha8?: string;
   cache_prefix_system_sha8?: string;
   cache_prefix_head_sha8?: string;
+  /** The span Anthropic really caches (through the last cache_control marker),
+   *  its size, and the marker's position. Unstable marked digest ⇒ pxpipe-side
+   *  bust; stable digest with cache_read 0 ⇒ look upstream, not at the rewrite. */
+  cache_prefix_marked_sha8?: string;
+  cache_prefix_marked_bytes?: number;
+  cache_prefix_marker_pos?: string;
 
   // From TransformInfo.env:
   cwd?: string;
@@ -288,6 +294,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.cachePrefixToolsSha8) out.cache_prefix_tools_sha8 = info.cachePrefixToolsSha8;
     if (info.cachePrefixSystemSha8) out.cache_prefix_system_sha8 = info.cachePrefixSystemSha8;
     if (info.cachePrefixHeadSha8) out.cache_prefix_head_sha8 = info.cachePrefixHeadSha8;
+    if (info.cachePrefixMarkedSha8) out.cache_prefix_marked_sha8 = info.cachePrefixMarkedSha8;
+    if (info.cachePrefixMarkedBytes !== undefined)
+      out.cache_prefix_marked_bytes = info.cachePrefixMarkedBytes;
+    if (info.cachePrefixMarkerPos) out.cache_prefix_marker_pos = info.cachePrefixMarkerPos;
     if (info.unknownStaticTags && info.unknownStaticTags.length > 0)
       out.unknown_static_tags = info.unknownStaticTags;
     if (info.churningStaticTags && info.churningStaticTags.length > 0)

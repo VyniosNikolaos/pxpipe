@@ -115,6 +115,27 @@ describe('cache-bust attribution telemetry', () => {
     expect(b.info.cachePrefixSha8).not.toBe(a.info.cachePrefixSha8);
   });
 
+  it('digests the MARKED span (what Anthropic caches) and records the marker position', async () => {
+    const { info } = await transformRequest(ccBody());
+    expect(info.cachePrefixMarkedSha8).toBeDefined();
+    expect(info.cachePrefixMarkerPos).toMatch(/^m\d+\.b\d+$/);
+    // The marked span ends at the breakpoint, so it is a strict subset of the
+    // boundary-scoped prefix (which runs to the end of the history message).
+    expect(info.cachePrefixMarkedBytes!).toBeLessThanOrEqual(info.cachePrefixBytes!);
+  });
+
+  it('keeps the marked span byte-identical while the live tail grows', async () => {
+    // The contract that decides whether cache_read happens: two consecutive
+    // turns of one session must send the SAME bytes up to the breakpoint. The
+    // newest freeze chunk re-renders by design, so a boundary-scoped digest may
+    // legitimately move — the marked one may not.
+    const a = await transformRequest(ccBody({ turns: 15 }));
+    const b = await transformRequest(ccBody({ turns: 17 }));
+    expect(b.info.collapsedTurns).toBe(a.info.collapsedTurns); // same collapse window
+    expect(b.info.cachePrefixMarkerPos).toBe(a.info.cachePrefixMarkerPos);
+    expect(b.info.cachePrefixMarkedSha8).toBe(a.info.cachePrefixMarkedSha8);
+  });
+
   it('moves the system digest when volatile text rides inside the pinned span', async () => {
     // `# Environment` churns every turn (cwd, git status, model id). Whatever
     // survives as system TEXT is inside the pinned prefix and must show up as a
