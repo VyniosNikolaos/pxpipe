@@ -132,7 +132,9 @@ export interface FullStatsSummary {
   cacheReadTokensTotal: number;
   outputTokensTotal: number;
   cacheHitEvents: number;
-  eventsWithBaseline: number;
+  // Denominator for the event-based cache-hit rate: events that carried usage
+  // data at all. Emitted by stats.ts as `eventsWithUsage`.
+  eventsWithUsage: number;
   origCharsTotal: number;
   imageBytesTotal: number;
   pinCharsTotal?: number;

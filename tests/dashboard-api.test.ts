@@ -15,7 +15,11 @@ import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicab
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
 import type { StatsPayload, RecentPayload } from '../src/dashboard/types.js';
-import { renderHeaderFragment, renderPage } from '../src/dashboard/fragments.js';
+import {
+  renderHeaderFragment,
+  renderPage,
+  renderStatsTableFragment,
+} from '../src/dashboard/fragments.js';
 
 function makeTmp(): SessionsPaths {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pxpipe-dashapi-'));
@@ -1002,5 +1006,37 @@ describe('server-observed warmth: text follows actual cache_read', () => {
     expect(row.baseline_input).toBe(12000);
     expect(row.baseline_input).not.toBe(35000); // the inflated cold-priced bug value
     expect(row.session_saved_so_far_delta).toBe(9900);
+  });
+});
+
+/**
+ * Regression: the dashboard's "cache hit rate (by events)" row read a summary
+ * field (`eventsWithBaseline`) that stats.ts never emitted — it emits
+ * `eventsWithUsage`. The field existed in the payload *type*, so tsc stayed
+ * quiet, and the row silently rendered "-" forever. This test walks the real
+ * path (fold -> summaryToJson -> renderStatsTableFragment) so any future
+ * rename on either side fails here instead of blanking the dashboard.
+ */
+describe('stats table: event-based cache hit rate', () => {
+  it('renders a real percentage from the summary stats.ts actually emits', async () => {
+    const { newSummary, fold, summaryToJson } = await import('../src/stats.js');
+    let s = newSummary();
+    // 3 events with usage, 2 of them cache hits -> 66.7%
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 900 } as TrackEvent);
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 900 } as TrackEvent);
+    s = fold(s, { input_tokens: 100, cache_read_tokens: 0 } as TrackEvent);
+    // an event carrying no usage at all must not dilute the denominator
+    s = fold(s, { cwd: '/tmp' } as TrackEvent);
+
+    const summary = summaryToJson(s);
+    expect(summary.eventsWithUsage).toBe(3);
+    expect(summary.cacheHitEvents).toBe(2);
+
+    const html = renderStatsTableFragment({ summary } as never);
+    // Pin the value to its own row: the table is a single line, so a bare
+    // "contains" would also pass on some other row's number.
+    const evRow = /<td>cache hit \(by events\)<\/td><td class="num">([^<]*)<\/td>/.exec(html);
+    expect(evRow, 'the "cache hit (by events)" row must exist').not.toBeNull();
+    expect(evRow![1]).toBe('66.7%'); // not '-', which is what the dead field produced
   });
 });
