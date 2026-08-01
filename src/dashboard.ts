@@ -29,6 +29,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as readline from 'node:readline';
 import type { ProxyEvent } from './core/proxy.js';
 import type { TrackEvent } from './core/tracker.js';
@@ -1497,7 +1498,7 @@ export class DashboardState {
   }
 
   serveHtml(port: number): Response {
-    return htmlResponse(renderPage(port));
+    return htmlResponse(renderPage(port, dashboardHostLabel()));
   }
 
   /** GET /fragments/<name> — server-rendered htmx fragments. Each one reuses
@@ -1714,6 +1715,22 @@ export function dashboardPath(pathname: string): DashboardRoute | null {
     return { kind: 'fragment', name: pathname.slice('/fragments/'.length) };
   }
   return null;
+}
+
+/** Name of the machine serving this dashboard, shown in the title and topbar.
+ *  PXPIPE_DASH_LABEL overrides it for hosts whose system hostname says nothing
+ *  useful (containers, "localhost"); an explicitly empty label opts out and
+ *  renders the unlabelled page. */
+export function dashboardHostLabel(): string {
+  const override = process.env.PXPIPE_DASH_LABEL;
+  if (override !== undefined) return override.trim();
+  try {
+    const h = os.hostname().trim();
+    // Keep it short: FQDNs push the chip past the wordmark for no added meaning.
+    return h.split('.')[0] || '';
+  } catch {
+    return '';
+  }
 }
 
 function htmlResponse(body: string): Response {

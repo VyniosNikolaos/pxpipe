@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { DashboardState, dashboardPath } from '../src/dashboard.js';
+import { DashboardState, dashboardPath, dashboardHostLabel } from '../src/dashboard.js';
 import { getAllowedModelBases, setAllowedModelBases } from '../src/core/applicability.js';
 import type { SessionsPaths } from '../src/sessions.js';
 import type { TrackEvent } from '../src/core/tracker.js';
@@ -364,6 +364,43 @@ describe('serveFragment', () => {
   it('404s unknown fragments', async () => {
     const res = await dash.serveFragment('nope', url, 1);
     expect(res.status).toBe(404);
+  });
+});
+
+describe('dashboard host label', () => {
+  it('names the host in the title and topbar so two hosts are distinguishable', () => {
+    const html = renderPage(47821, 'ber-dev-lm-ai');
+    expect(html).toContain('<title>ber-dev-lm-ai · pxpipe dashboard</title>');
+    expect(html).toContain('class="hostchip"');
+    expect(html).toContain('>ber-dev-lm-ai<');
+  });
+
+  it('renders the unlabelled page when no host label is given', () => {
+    const html = renderPage(47821);
+    expect(html).toContain('<title>pxpipe — live dashboard</title>');
+    expect(html).not.toContain('class="hostchip"');
+  });
+
+  it('escapes the label instead of injecting it as markup', () => {
+    const html = renderPage(47821, '<img src=x onerror=alert(1)>');
+    expect(html).not.toContain('<img src=x');
+    expect(html).toContain('&lt;img src=x');
+  });
+
+  it('prefers PXPIPE_DASH_LABEL and shortens an FQDN hostname', () => {
+    const prev = process.env.PXPIPE_DASH_LABEL;
+    try {
+      process.env.PXPIPE_DASH_LABEL = 'edi-prod';
+      expect(dashboardHostLabel()).toBe('edi-prod');
+      // An explicitly empty override opts out of the chip entirely.
+      process.env.PXPIPE_DASH_LABEL = '';
+      expect(dashboardHostLabel()).toBe('');
+      delete process.env.PXPIPE_DASH_LABEL;
+      expect(dashboardHostLabel()).toBe(os.hostname().split('.')[0]);
+    } finally {
+      if (prev === undefined) delete process.env.PXPIPE_DASH_LABEL;
+      else process.env.PXPIPE_DASH_LABEL = prev;
+    }
   });
 });
 

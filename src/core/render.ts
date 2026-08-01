@@ -257,6 +257,23 @@ export const DEFAULT_CELL_H_BONUS = 0;
 export const CELL_W = ATLAS_CELL_W + DEFAULT_CELL_W_BONUS;
 export const CELL_H = ATLAS_CELL_H + DEFAULT_CELL_H_BONUS;
 
+/** Visual rows per image: `floor((MAX_HEIGHT_PX − 2·PAD_Y) / CELL_H)`. Derived
+ *  from the cell geometry above so break-even math auto-tracks it. */
+export const LINES_PER_IMAGE = Math.max(1, Math.floor((MAX_HEIGHT_PX - 2 * PAD_Y) / CELL_H));
+
+/** Real char capacity of one page AT A GIVEN COLUMN WIDTH.
+ *
+ *  Lives here, next to the geometry it is derived from, because every caller that
+ *  budgets images must price pages at the width it actually renders at. The
+ *  DENSE_CONTENT_CHARS_PER_IMAGE constant is only correct for DENSE_CONTENT_COLS
+ *  (312×90); using it while rendering at, say, COLS=100 overstates capacity 3.1×,
+ *  so an image budget clears a plan that then emits 3× the images — the request
+ *  blows the API's per-request limit and comes back 500. Always pass the cols the
+ *  renderer will actually use. */
+export function maxCharsPerImage(cols: number): number {
+  return Math.min(Math.max(1, cols) * LINES_PER_IMAGE, READABLE_CHARS_PER_IMAGE);
+}
+
 export interface RenderedImage {
   png: Uint8Array;
   width: number;

@@ -27,6 +27,14 @@ export interface TrackEvent {
    *  Compare with image_count: textTokens(n/4) vs imageTokens(n×2500). */
   compressed_chars?: number;
   image_count?: number;
+  /** Images the CLIENT already put on the wire (pasted screenshots, tool-returned
+   *  pictures). They spend from the same provider cap as ours, so this is the
+   *  number that explains an otherwise-surprising image_budget passthrough. */
+  native_images?: number;
+  /** Imaging paths that degraded to text because the wire cap was full. Nonzero
+   *  here plus a fat request means the client's own images crowded us out — the
+   *  request stayed valid, but the token win was skipped. */
+  image_budget_skips?: number;
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
@@ -222,6 +230,10 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
       out.compressed_chars = info.compressedChars;
     }
     if (info.imageCount !== undefined) out.image_count = info.imageCount;
+    // Only when nonzero: a wire without client images is the common case and
+    // should not pay a key per event.
+    if ((info.nativeImages ?? 0) > 0) out.native_images = info.nativeImages;
+    if ((info.imageBudgetSkips ?? 0) > 0) out.image_budget_skips = info.imageBudgetSkips;
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
@@ -275,7 +287,7 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     }
     if (info.passthroughReasons) {
       const pr = info.passthroughReasons;
-      if ((pr.below_threshold ?? 0) > 0 || (pr.not_profitable ?? 0) > 0) {
+      if (Object.values(pr).some((n) => (n ?? 0) > 0)) {
         out.passthrough_reasons = pr;
       }
     }

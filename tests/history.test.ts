@@ -443,7 +443,7 @@ describe('collapseHistory', () => {
 
     const content = out[0]!.content as Array<Record<string, unknown>>;
     const textBlocks = content.filter((c) => c.type === 'text') as Array<{ text: string }>;
-    const cue = textBlocks.find((b) => b.text.includes('was too long to carry as text'))!;
+    const cue = textBlocks.find((b) => b.text.includes('too long to carry as text'))!;
     expect(cue.text).toContain(`<user t="10">`);
     // The over-cap prompt is imaged separately, so it never lands in the verbatim block.
     const verbatim = textBlocks.find((b) => b.text.includes('User turns from this session'))!;
@@ -451,6 +451,38 @@ describe('collapseHistory', () => {
     // ...and it is not merged into the history transcript either.
     const transcript = textBlocks.find((b) => b.text.includes('attribute every turn strictly by its tag'))!;
     expect(transcript.text).not.toContain('PASTED DOC');
+  });
+
+  it('batches many over-cap user prompts so images scale with bytes, not with prompt count', async () => {
+    // Regression (#161): one image per pasted document put a floor of ≥1 image on
+    // every such turn that no grid coarsening could lift — 175 pasted logs rendered
+    // 175 near-empty images, past the wire cap, and upstream answered 500.
+    const msgs: Message[] = [];
+    for (let i = 0; i < 120; i++) {
+      msgs.push(i % 2 === 0 ? usr('PASTED ' + 'y'.repeat(3500)) : asst(`turn ${i}: ` + 'x'.repeat(400)));
+    }
+
+    const { messages: out, info } = await collapseHistory(msgs, profitable, {
+      keepTail: 2,
+      minCollapsePrefix: 5,
+      cols: 100,
+      collapseChunk: 0,
+      imageBudget: 100,
+    });
+
+    const content = out[0]!.content as Array<Record<string, unknown>>;
+    const images = content.filter((c) => c.type === 'image').length;
+    // 59 over-cap prompts: one image each would be ≥59 on top of the transcript.
+    expect(images).toBeLessThanOrEqual(100);
+    expect(images).toBeLessThan(59);
+    // The estimate the budget cleared must be the count that actually goes out.
+    expect(info.collapsedImages).toBe(images);
+    const textBlocks = content.filter((c) => c.type === 'text') as Array<{ text: string }>;
+    // Attribution survives batching: every batched turn is still named, in the cue
+    // for whichever chunk carries it.
+    const cues = textBlocks.filter((b) => b.text.includes('too long to carry as text'));
+    const named = cues.map((b) => b.text).join('\n');
+    for (const t of [0, 10, 20, 58]) expect(named).toContain(`<user t="${t}">`);
   });
 
   it('splits dense collapsed history into readable image pages with only a bounded recency pointer', async () => {

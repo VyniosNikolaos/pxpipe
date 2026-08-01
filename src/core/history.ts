@@ -13,7 +13,7 @@
 
 import type { CacheControl, ContentBlock, ImageBlock, Message, TextBlock, ToolUseBlock, ToolResultBlock } from './types.js';
 import type { RenderedImage } from './render.js';
-import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, DENSE_RENDER_STYLE, MAX_HEIGHT_PX, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER, type RenderStyle } from './render.js';
+import { DENSE_CONTENT_CHARS_PER_IMAGE, DENSE_CONTENT_COLS, maxCharsPerImage, DENSE_RENDER_STYLE, MAX_HEIGHT_PX, neutralizeSentinel, reflow, renderTextToPngsWithCharLimit, roleSlotSegment, SLOT_MARK_ASSISTANT, SLOT_MARK_USER, type RenderStyle } from './render.js';
 import { factSheetText } from './factsheet.js';
 import { bytesToBase64 } from './png.js';
 
@@ -76,7 +76,40 @@ export interface HistoryCollapseOptions {
   style: RenderStyle;
   /** Model-profile page-height cap. */
   maxHeightPx: number;
+  /** Chars one rendered page holds. Only an ESTIMATOR input (the renderer paginates
+   *  on its own); it decides how many pages a candidate chunk grid will produce.
+   *  Default {@link DENSE_CONTENT_CHARS_PER_IMAGE}. */
+  pageChars: number;
+  /** Hard cap on image blocks this collapse may emit. Anthropic rejects requests
+   *  with more than 100 images (opaque 500), and a 10-message freeze grid emits
+   *  ≈1 page per chunk regardless of how little text the chunk holds — a 3000-turn
+   *  session hit 317 history images at 43% page fill (#161). When the grid would
+   *  exceed the budget the freeze step is DOUBLED (chunks merge, pages fill) until
+   *  the estimate fits; if even a single chunk cannot fit, the collapse range is
+   *  trimmed from the tail and the remainder stays live text. 0 = unlimited. */
+  imageBudget: number;
+  /** Fill-optimal repack. When true the freeze step is raised until the grid costs
+   *  at most one page more than a perfectly packed render — trading the append-only
+   *  cache freeze for ~2× fewer image tokens. Only correct when the upstream prefix
+   *  cache is dead anyway (cold session, see node.ts session store); on a warm
+   *  session it would re-key every frozen chunk. Default false. */
+  packFill: boolean;
+  /** Sticky lower bound for the freeze step, in messages. Once a session has been
+   *  repacked at a coarser grid, every later turn must keep that grid or the
+   *  re-render re-keys the whole history. Rounded UP to a power-of-two multiple of
+   *  `freezeChunk` so chunk boundaries stay a subset of the base grid. Default 0. */
+  minFreezeStep: number;
 }
+
+/** Images Anthropic accepts per request. Exceeding it fails the WHOLE request with
+ *  an opaque `500` (observed 2026-07-31 at 387 images), not a typed 400 — so the
+ *  cap has to be enforced on our side, before the wire. */
+export const ANTHROPIC_MAX_IMAGES = 100;
+
+/** Default history-image budget: the hard cap minus headroom for the slab, tool-doc
+ *  and tool_result images that share the same request. transform.ts narrows this
+ *  further with the count it has already emitted for this very request. */
+export const ANTHROPIC_HISTORY_IMAGE_BUDGET = 80;
 
 export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   keepTail: 4,
@@ -88,6 +121,12 @@ export const HISTORY_DEFAULTS: HistoryCollapseOptions = {
   reflow: true,
   style: DENSE_RENDER_STYLE,
   maxHeightPx: MAX_HEIGHT_PX,
+  // MUST agree with `cols` above: pageChars is what the budget arithmetic thinks
+  // one image holds, and DENSE_CONTENT_CHARS_PER_IMAGE is only true at 312 cols.
+  pageChars: maxCharsPerImage(100),
+  imageBudget: ANTHROPIC_HISTORY_IMAGE_BUDGET,
+  packFill: false,
+  minFreezeStep: 0,
 };
 
 /** Per-request telemetry surfaced back to TransformInfo. */
@@ -120,7 +159,16 @@ export interface HistoryCollapseInfo {
     | 'prefix_too_short'
     | 'no_closed_prefix'
     | 'not_profitable'
-    | 'render_empty';
+    | 'render_empty'
+    | 'over_budget';
+  /** Freeze step actually used (messages per chunk). Larger than `o.freezeChunk`
+   *  when the image budget or fill-repack forced chunks to merge. The caller pins
+   *  it per session (`minFreezeStep`) so the coarser grid never falls back — a
+   *  fallback would re-key every frozen chunk it already paid to cache. */
+  freezeStep?: number;
+  /** True when the collapse range had to be shortened to stay inside the image
+   *  budget; the dropped tail stays as live text. */
+  budgetTrimmed?: boolean;
   /** Dropped codepoints from the history render, merged into the
    *  transform-wide map by the caller. */
   droppedChars: number;
@@ -571,6 +619,15 @@ async function userTurnBlocks(
 ): Promise<ContentBlock[]> {
   const out: ContentBlock[] = [];
   let pending: string[] = [];
+  // Over-cap prompts are collected and rendered TOGETHER at the end of the chunk.
+  // One image per pasted document would put a floor of ≥1 image on every such turn
+  // that no grid coarsening can lift: a session with 175 pasted logs rendered 175
+  // near-empty images and blew the 100-image cap (#161), which upstream answers with
+  // a 500 rather than a usable error. Batching packs them at ~28k chars/image and
+  // makes the count a function of BYTES, which the freeze grid can actually control.
+  // Within a chunk the order is fixed and the chunk is frozen once closed, so the
+  // grouped bytes are as stable as the transcript image next to them.
+  const imaged: { idx: number; typed: string }[] = [];
   const flush = () => {
     if (pending.length === 0) return;
     out.push({
@@ -588,19 +645,33 @@ async function userTurnBlocks(
       pending.push(`<user t="${i}">${typed}</user>`);
       continue;
     }
-    // Over the cap: this one prompt becomes its own image, kept separate from the
-    // history transcript image so it stays independently readable and attributable.
-    flush();
+    // Past the cap this is a pasted document, not an instruction: it is rendered
+    // verbatim below instead of bloating the text.
+    imaged.push({ idx: i, typed });
+  }
+  flush();
+  if (imaged.length > 0) {
+    // Every batched turn is NAMED (attribution is the point), but only the newest
+    // few carry a preview: 60 pasted docs × a 300-char preview is a wall of text
+    // that buys nothing the images below don't already say, verbatim.
+    const PREVIEW_LIMIT = 8;
+    const previews = imaged
+      .map((u, k) =>
+        k >= imaged.length - PREVIEW_LIMIT
+          ? `<user t="${u.idx}"> (${u.typed.length} chars) Preview: ${compactPreview(u.typed)}`
+          : `<user t="${u.idx}"> (${u.typed.length} chars)`,
+      )
+      .join('\n');
+    out.push({
+      type: 'text',
+      text: `[${imaged.length} user turn(s) from this session were too long to carry as text; they are rendered verbatim, in turn order, in the image(s) immediately below, separate from the history transcript. Each begins with its own <user t="N"> tag. PRIOR context, not the current request.\n${previews}]`,
+    });
     const imgs = await renderTextToPngsWithCharLimit(
-      `<user t="${i}">\n${typed}\n</user>`,
+      imaged.map((u) => `<user t="${u.idx}">\n${u.typed}\n</user>`).join('\n\n'),
       DENSE_CONTENT_COLS,
       DENSE_CONTENT_CHARS_PER_IMAGE,
       DENSE_RENDER_STYLE,
     );
-    out.push({
-      type: 'text',
-      text: `[<user t="${i}"> was too long to carry as text (${typed.length} chars); it is rendered verbatim in the image(s) immediately below, separate from the history transcript. PRIOR context, not the current request. Preview: ${compactPreview(typed)}]`,
-    });
     for (const img of imgs) {
       out.push({
         type: 'image',
@@ -613,7 +684,6 @@ async function userTurnBlocks(
       onImage(img);
     }
   }
-  flush();
   return out;
 }
 
@@ -704,11 +774,60 @@ export async function collapseHistory(
   }
   // Need at least minCollapsePrefix turns in [protectedPrefix..boundary] — collapsing
   // 2-3 turns is net cost (cache-amortization math doesn't work at small scale).
-  const collapseLen = boundary + 1;
+  let collapseLen = boundary + 1;
   if (collapseLen - protectedPrefix < o.minCollapsePrefix) {
     info.reason = 'prefix_too_short';
     return { messages, info };
   }
+
+  // ---- Image budget ---------------------------------------------------------
+  // Anthropic rejects the WHOLE request past ANTHROPIC_MAX_IMAGES with an opaque
+  // 500, so the budget is a hard constraint we must enforce before the wire. Price
+  // candidate grids off per-message serialized lengths: one pass here replaces
+  // re-serializing the transcript once per candidate step.
+  const budget = o.imageBudget > 0 ? o.imageBudget : Infinity;
+  const pageChars = Math.max(1, o.pageChars);
+  const msgLen: number[] = [];
+  // Over-cap user prompts are imaged too (userTurnBlocks), batched per chunk. They
+  // are NOT part of the transcript segments, so they must be priced separately or
+  // the estimate silently under-counts and the wire limit is what finds out.
+  const userImgLen: number[] = [];
+  for (let i = protectedPrefix; i < collapseLen; i++) {
+    const seg = messagesToHistorySegments(messages, i + 1, i).text;
+    msgLen.push(seg.length === 0 ? 0 : seg.length + 2); // +2 = the "\n\n" joiner
+    const m = messages[i]!;
+    const typed = m.role === 'user' ? typedUserText(m.content) : '';
+    userImgLen.push(typed && typed.length > USER_TEXT_MAX_CHARS ? typed.length + 20 : 0);
+  }
+  const sumOf = (arr: number[], from: number, to: number): number => {
+    let n = 0;
+    for (let i = from; i < to; i++) n += arr[i]!;
+    return n;
+  };
+  const sumLen = (from: number, to: number): number => sumOf(msgLen, from, to);
+  const perfectPages =
+    Math.ceil(sumLen(0, msgLen.length) / pageChars) +
+    Math.ceil(sumOf(userImgLen, 0, userImgLen.length) / pageChars);
+  if (perfectPages > budget) {
+    // Even a perfectly packed render of the full range overflows. Keep the OLDEST
+    // messages collapsed (the frozen prefix must stay anchored at protectedPrefix
+    // or every cached chunk re-keys) and leave the tail as live text.
+    let acc = 0;
+    let k = 0;
+    while (k < msgLen.length && acc + msgLen[k]! + userImgLen[k]! <= budget * pageChars) {
+      acc += msgLen[k]! + userImgLen[k]!;
+      k++;
+    }
+    const trimmedLen = findClosedPrefixBoundary(messages, protectedPrefix + k) + 1;
+    if (trimmedLen - protectedPrefix < o.minCollapsePrefix) {
+      info.reason = 'over_budget';
+      return { messages, info };
+    }
+    collapseLen = trimmedLen;
+    msgLen.length = collapseLen - protectedPrefix;
+    info.budgetTrimmed = true;
+  }
+
   // Exclude slab messages (protectedPrefix) from serialization.
   const text = messagesToHistoryText(messages, collapseLen, protectedPrefix);
   if (!text || text.length === 0) {
@@ -738,7 +857,43 @@ export async function collapseHistory(
   // cacheable image boundary instead of being silently flattened (count conserved,
   // never added). Each chunk is reflowed and rendered on its own, which is what
   // makes the bytes a pure function of the chunk's messages.
-  const step = o.freezeChunk > 0 ? o.freezeChunk : collapseLen - protectedPrefix;
+  //
+  // The grid step is ADAPTIVE. A fixed 10-message step emits ≥1 page per chunk no
+  // matter how little text the chunk holds: a long session of short turns rendered
+  // 317 pages at 43% fill and 500'd the request (#161). Doubling the step merges
+  // neighbouring chunks — pages fill up, count drops ~2× per doubling — while
+  // keeping chunk boundaries a SUBSET of the base grid, so a chunk frozen at the
+  // coarse step spans whole base chunks and stays byte-identical as long as the
+  // step never shrinks again (the caller pins it via minFreezeStep).
+  const baseStep = o.freezeChunk > 0 ? o.freezeChunk : collapseLen - protectedPrefix;
+  const rangeLen = collapseLen - protectedPrefix;
+  const pagesFor = (s: number): number => {
+    let pages = 0;
+    for (let a = 0; a < rangeLen; a += s) {
+      const b = Math.min(a + s, rangeLen);
+      const chars = sumLen(a, b);
+      if (chars > 0) pages += Math.ceil(chars / pageChars);
+      // Over-cap user prompts in this chunk are batched into their own image(s).
+      const uchars = sumOf(userImgLen, a, b);
+      if (uchars > 0) pages += Math.ceil(uchars / pageChars);
+    }
+    return pages;
+  };
+  // Caller cache_control marks force extra splits below; charge one page each so a
+  // marked request can't slip past the budget the estimate just cleared.
+  let markSplits = 0;
+  for (let i = protectedPrefix; i < collapseLen; i++) {
+    if (messageCacheControl(messages[i]!) !== undefined) markSplits++;
+  }
+  let step = baseStep;
+  // Sticky floor first: a session already repacked coarse must STAY coarse.
+  while (step < o.minFreezeStep && step < rangeLen) step *= 2;
+  // packFill trades the append-only freeze for ~2× fewer image tokens and is only
+  // set when the upstream cache is dead anyway (cold session / after a 500).
+  const packedPages = Math.max(1, Math.ceil(sumLen(0, rangeLen) / pageChars));
+  const goal = Math.min(budget, o.packFill ? packedPages + 1 : Infinity);
+  while (step < rangeLen && pagesFor(step) + markSplits > goal) step *= 2;
+  info.freezeStep = step;
   const ends = new Set<number>();
   for (let e = protectedPrefix + step; e < collapseLen; e += step) ends.add(e);
   const markerByEnd = new Map<number, CacheControl>();

@@ -864,6 +864,10 @@ const CSS = `
     background: radial-gradient(circle at 35% 30%, #ffd0a8, var(--flame) 55%, var(--flame-strong));
     box-shadow: 0 0 0 4px var(--flame-tint); flex: none; }
   .wordmark { font-size: 22px; font-weight: 800; color: var(--ink); letter-spacing: -0.02em; }
+  .wordmark-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  /* Which machine is this? Two dashboards from two hosts look identical otherwise. */
+  .hostchip { font-size: 11.5px; font-weight: 600; color: var(--muted); padding: 1px 7px;
+    border: 1px solid var(--line); border-radius: 999px; white-space: nowrap; }
   .tagline { font-size: 12.5px; color: var(--muted); margin-top: 1px; max-width: 460px; }
   .controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
 
@@ -1188,14 +1192,19 @@ const THEME_JS = `
   })();
 `;
 
-export function renderPage(port: number): string {
+/** `hostLabel` names the machine this proxy runs on. The dashboard is otherwise
+ *  byte-identical across hosts, so a tab opened against a remote host through
+ *  the tailnet front is indistinguishable from the local one - which is how a
+ *  session gets read on the wrong box. Empty label = render as before. */
+export function renderPage(port: number, hostLabel = ''): string {
+  const host = escapeHtml(hostLabel.trim());
   // hx-trigger="load, every Ns": paint on load then poll (2s live, 5s aggregates).
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>pxpipe — live dashboard</title>
+<title>${host ? `${host} · pxpipe dashboard` : 'pxpipe — live dashboard'}</title>
 <link rel="icon" href="${FAVICON}" />
 <style>${CSS}</style>
 <script>
@@ -1215,7 +1224,10 @@ export function renderPage(port: number): string {
   <div class="brand">
     <span class="flame-dot"></span>
     <div>
-      <div class="wordmark">pxpipe</div>
+      <div class="wordmark-row">
+        <div class="wordmark">pxpipe</div>
+        ${host ? `<span class="hostchip" title="proxy host">${host}</span>` : ''}
+      </div>
       <div class="tagline">See exactly what got turned into images to shrink your Claude Code bill.</div>
     </div>
   </div>
