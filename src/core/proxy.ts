@@ -3,6 +3,7 @@
  * Adapted by src/node.ts and src/worker.ts; uses only Request/Response/URL/fetch.
  */
 
+import { markCacheDead, responseLeftNoCache } from './session-state.js';
 import { transformRequest, type TransformOptions, type TransformInfo } from './transform.js';
 import { isClaudeModel, transformOpenAIChatCompletions, transformOpenAIResponses } from './openai.js';
 import { isAnthropicMessagesPath, isPxpipeSupportedGptModel, isPxpipeSupportedModel } from './applicability.js';
@@ -1558,6 +1559,12 @@ export function createProxy(config: ProxyConfig = {}) {
       measurementPromise.catch(() => undefined),
       stopReasonPromise.catch(() => undefined),
     ]).then(([usage, errorBody, measurement, stopReason]) => {
+      // A rejected request never populated a prefix cache, so the append-only
+      // freeze this session was protecting protects nothing: let the next turn
+      // re-cut the grid for density instead of preserving dead bytes.
+      if (responseLeftNoCache(upstreamRes.status, errorBody)) {
+        markCacheDead(info?.firstUserSha8);
+      }
       fire(
         upstreamRes.status,
         info,

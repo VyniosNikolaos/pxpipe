@@ -132,6 +132,34 @@ export function markCacheDead(sessionKey: string | undefined): void {
   touch(sessionKey).cacheDead = true;
 }
 
+/**
+ * Did this response leave the upstream prefix cache unpopulated?
+ *
+ * A cache entry is written by a request the provider actually *accepted*. Three
+ * outcomes mean it never got that far, so the frozen grid we were protecting
+ * protects nothing and the next turn may re-cut for density:
+ *
+ *  - `413` — payload rejected outright;
+ *  - `400` whose body says the prompt is too long (Anthropic's wording varies:
+ *    `prompt is too long`, `prompt_too_long`, `request_too_large`);
+ *  - `5xx` — includes the opaque `500` an over-cap image count produces.
+ *
+ * Every other 4xx (bad key, rate limit, overloaded) says nothing about the
+ * cache: the prefix may well still be live, so we leave the session warm and
+ * keep the cheap append-only path. Guessing "cold" there would re-cut a live
+ * grid and burn the whole prefix as `cache_create` — the exact failure this
+ * module exists to avoid.
+ */
+export function responseLeftNoCache(status: number, errorBody?: string): boolean {
+  if (status === 413) return true;
+  if (status >= 500) return true;
+  if (status === 400 && errorBody) {
+    return /prompt[\s_-]*(is\s*)?too[\s_-]*long|request[\s_-]*too[\s_-]*large|too many (images|tokens)/i
+      .test(errorBody);
+  }
+  return false;
+}
+
 /** Test seam: drop all session state. */
 export function resetSessionState(): void {
   sessions.clear();

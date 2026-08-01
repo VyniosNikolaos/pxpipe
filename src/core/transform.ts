@@ -655,6 +655,10 @@ export interface TransformInfo {
   nativeImages?: number;
   /** Imaging steps skipped because the cap was exhausted (telemetry for tuning). */
   imageBudgetSkips?: number;
+  /** Image blocks actually present in the outgoing body — ours AND the client's.
+   *  This is the only number the provider counts. It is <= imageCount + nativeImages
+   *  because the history collapse can absorb messages that already carried images. */
+  wireImages?: number;
   /** Chars of tool docs moved to the system-text Tool Reference (not imaged). */
   toolDocsChars?: number;
   /** Codepoints missing from the atlas (rendered as blank cells). Telemetry for atlas tuning. */
@@ -1906,6 +1910,13 @@ async function runHistoryCollapseAndFinalize(
   }
   applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
+  // Ground truth, counted from the bytes we are about to send. `imageCount` is
+  // what we RENDERED, and the two differ: the collapse replaces whole messages,
+  // so any tool_result image inside the collapsed range never reaches the wire.
+  // Measured on a tool-heavy shape: 95 rendered, 27 on the wire. The provider
+  // only ever sees this number, so telemetry and any future headroom math must
+  // read it and not the render counter.
+  info.wireImages = countNativeImages(req.messages);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info, collapsed: collapsedFlag };
 }
@@ -2711,6 +2722,8 @@ export async function transformRequest(
   }
   applyPins(req, info, pins);
   info.outgoingTextChars = countOutgoingTextChars(req);
+  // Ground truth for the main path too — see the note at the other call site.
+  info.wireImages = countNativeImages(req.messages);
   const outBody = new TextEncoder().encode(JSON.stringify(req));
   return { body: outBody, info };
 }

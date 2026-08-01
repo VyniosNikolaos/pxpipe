@@ -35,6 +35,10 @@ export interface TrackEvent {
    *  here plus a fat request means the client's own images crowded us out — the
    *  request stayed valid, but the token win was skipped. */
   image_budget_skips?: number;
+  /** Image blocks really on the wire. Present only when it differs from
+   *  image_count + native_images — i.e. when the history collapse absorbed
+   *  messages that already carried images, so we rendered more than we sent. */
+  wire_images?: number;
   image_bytes?: number;
   /** Total pixel area across all rendered images; pairs with cache_create_tokens for px/token regression. */
   image_pixels?: number;
@@ -77,6 +81,16 @@ export interface TrackEvent {
   collapsed_images?: number;
   /** Why history collapse didn't run (or did). Diagnostic. */
   history_reason?: string;
+  /** Messages packed per history image. Rises when the grid is re-cut coarser;
+   *  never falls within a session, because a finer re-cut re-keys every chunk. */
+  history_freeze_step?: number;
+  /** Set when the grid was coarsened purely to fit the image budget — the turn
+   *  paid legibility for a request that would otherwise have been rejected. */
+  history_budget_trimmed?: boolean;
+  /** Set when the session's upstream cache was provably dead and the collapse
+   *  was therefore allowed to repack for density. Pair with cache_read_tokens:
+   *  a repack that lands on a live cache would show as a cache_create spike. */
+  history_pack_fill?: boolean;
   /** Codepoints not in the glyph atlas. A spike means users type glyphs we don't ship — widen ATLAS_PROFILE. */
   dropped_chars?: number;
   /** Top-20 dropped codepoints (U+HHHH keys) by frequency. Only present when dropped_chars > 0. */
@@ -234,6 +248,12 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     // should not pay a key per event.
     if ((info.nativeImages ?? 0) > 0) out.native_images = info.nativeImages;
     if ((info.imageBudgetSkips ?? 0) > 0) out.image_budget_skips = info.imageBudgetSkips;
+    // Emit only when it disagrees with the render counter: equality is the common
+    // case and a per-event key for "nothing to see" is noise.
+    if (info.wireImages !== undefined
+        && info.wireImages !== (info.imageCount ?? 0) + (info.nativeImages ?? 0)) {
+      out.wire_images = info.wireImages;
+    }
     if (info.imageBytes !== undefined) out.image_bytes = info.imageBytes;
     if (info.imagePixels !== undefined && info.imagePixels > 0) {
       out.image_pixels = info.imagePixels;
@@ -279,6 +299,9 @@ export function toTrackEvent(ev: ProxyEvent): TrackEvent {
     if (info.historyReason !== undefined) {
       out.history_reason = info.historyReason;
     }
+    if (info.historyFreezeStep !== undefined) out.history_freeze_step = info.historyFreezeStep;
+    if (info.historyBudgetTrimmed) out.history_budget_trimmed = true;
+    if (info.historyPackFill) out.history_pack_fill = true;
     if (info.droppedChars !== undefined && info.droppedChars > 0) {
       out.dropped_chars = info.droppedChars;
     }

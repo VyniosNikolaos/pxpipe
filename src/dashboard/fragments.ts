@@ -410,6 +410,14 @@ export interface ContextMapData {
   // on the same cache state as the image path; no wall-clock-only inference.
   output: number;
   imageCount: number;
+  /** Image blocks the CLIENT sent. They spend from the provider's cap exactly
+   *  like ours, so they explain a turn that compressed less than usual. */
+  nativeImages?: number;
+  /** Image blocks really on the wire. Lower than imageCount when the history
+   *  collapse absorbed messages that already carried our images. */
+  wireImages?: number;
+  /** Imaging steps that degraded to text because the cap was full. */
+  imageBudgetSkips?: number;
   baselineImagedTokens?: number;
   buckets: Partial<Record<string, number>>; // bucket → chars rendered to PNG
   imageIds: number[]; // image-ring ids for the gallery
@@ -555,6 +563,28 @@ export function renderContextMapFragment(
           : `Billed = after cache discounts (reads at 0.1×), same basis as the Saved column. ${rawPhrase}`;
   const title = isLatest ? 'Latest request' : 'Selected request';
 
+  // The provider caps a request at 100 image blocks and counts the CLIENT's
+  // images against the same limit. Three facts are worth showing, and only when
+  // they are true — a quiet turn should stay quiet:
+  //   - the client brought its own images (they shrank our room),
+  //   - we rendered more pages than we shipped (the collapse ate some),
+  //   - we gave up on imaging something because the cap was full.
+  const capBits: string[] = [];
+  if ((c.nativeImages ?? 0) > 0) {
+    capBits.push(`${c.nativeImages} image${c.nativeImages === 1 ? '' : 's'} came from your side and count against the same 100-image request cap`);
+  }
+  if (c.wireImages !== undefined && c.wireImages < c.imageCount + (c.nativeImages ?? 0)) {
+    const absorbed = c.imageCount + (c.nativeImages ?? 0) - c.wireImages;
+    capBits.push(`${absorbed} rendered page${absorbed === 1 ? '' : 's'} never went out — the history collapse absorbed those messages (${c.wireImages} on the wire)`);
+  }
+  if ((c.imageBudgetSkips ?? 0) > 0) {
+    capBits.push(`${c.imageBudgetSkips} block${c.imageBudgetSkips === 1 ? '' : 's'} stayed as text because the image cap was full`);
+  }
+  const capNote = capBits.length
+    ? `<div class="split-note cap-note">${capBits.map(escapeHtml).join(' · ')}</div>`
+    : '';
+
+
   return (
     `<div class="ctxmap">` +
     `<div class="ctx-headline"><span class="ctx-title">${title}</span> ${headline}</div>` +
@@ -564,6 +594,7 @@ export function renderContextMapFragment(
     `<div class="split-col split-img">` +
     `<div class="split-head">Compressed into images <span class="split-sum">${kFmt(totalImagedChars)} chars · ${c.imageCount} page${c.imageCount === 1 ? '' : 's'}</span></div>` +
     (imgRows || `<div class="ctx-row muted-row">nothing imaged this request</div>`) +
+    capNote +
     `<div class="split-note">pxpipe can misread exact values inside images — treat these as gist, not byte-exact.</div>` +
     `</div>` +
     `<div class="split-col split-txt">` +
@@ -1045,6 +1076,10 @@ const CSS = `
   .ctx-lbl { color: var(--ink-2); } .ctx-val { color: var(--ink); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .muted-row { color: var(--muted); font-style: italic; }
   .split-note { font-size: 10.5px; color: var(--muted); margin-top: 7px; }
+  /* Cap notes explain a turn that compressed less than the user expects, so they
+     must read as a reason, not as fine print. Warm tint, not an error colour —
+     nothing here is broken. */
+  .cap-note { color: var(--ink); border-left: 2px solid var(--flame); padding-left: 7px; }
   .pages-title { font-size: 11px; color: var(--ink-2); margin: 12px 0 6px; }
   .pages { display: flex; flex-wrap: wrap; gap: 6px; max-height: 320px; overflow: auto;
     background: var(--surface-2); padding: 6px; border: 1px solid var(--border); border-radius: 8px; }

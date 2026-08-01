@@ -208,3 +208,43 @@ describe('renderRecentFragment — billed delta presentation', () => {
     expect(html).not.toContain('class="num pos">—</td>');
   });
 });
+
+describe('renderContextMapFragment — the 100-image request cap', () => {
+  // The cap is the single most confusing thing about a turn that compressed
+  // badly: the user sees "only 3 pages imaged" and no reason why. These lines
+  // name the reason, and only when there is one.
+  it('says so when the client\'s own images ate into the cap', () => {
+    const html = renderContextMapFragment(ctx({ nativeImages: 12 }), []);
+    expect(html).toContain('12 images came from your side');
+    expect(html).toContain('100-image request cap');
+  });
+
+  it('reports pages that were rendered but never sent', () => {
+    // 40 ours + 2 theirs = 42 rendered, 28 on the wire → 14 absorbed.
+    const html = renderContextMapFragment(ctx({ imageCount: 40, nativeImages: 2, wireImages: 28 }), []);
+    expect(html).toContain('14 rendered pages never went out');
+    expect(html).toContain('28 on the wire');
+  });
+
+  it('reports blocks that stayed text because the cap was full', () => {
+    const html = renderContextMapFragment(ctx({ imageBudgetSkips: 3 }), []);
+    expect(html).toContain('3 blocks stayed as text');
+  });
+
+  it('uses the singular where it should', () => {
+    const html = renderContextMapFragment(ctx({ nativeImages: 1, imageBudgetSkips: 1 }), []);
+    expect(html).toContain('1 image came from your side');
+    expect(html).toContain('1 block stayed as text');
+  });
+
+  it('stays silent on an ordinary turn', () => {
+    const html = renderContextMapFragment(ctx({ imageCount: 3, wireImages: 3 }), []);
+    expect(html).not.toContain('cap-note');
+  });
+
+  it('stays silent when the wire count merely agrees', () => {
+    const html = renderContextMapFragment(ctx({ imageCount: 3, nativeImages: 0, wireImages: 3 }), []);
+    expect(html).not.toContain('never went out');
+  });
+});
+

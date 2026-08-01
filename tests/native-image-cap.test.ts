@@ -176,3 +176,45 @@ describe('the cap is quantitative, not boolean', () => {
     expect(info.reason).toMatch(/^image_budget/);
   });
 });
+
+describe('wireImages — what the provider actually counts', () => {
+  beforeEach(() => resetSessionState());
+
+  // The render counter and the wire disagree whenever the history collapse
+  // absorbs a message that already carried one of our images: the message is
+  // replaced wholesale, so the image inside it is never sent. Telemetry that
+  // reads imageCount therefore over-reports, and any headroom math that trusts
+  // it under-uses the budget.
+  it('reports the outgoing body, not the render count, on a tool-heavy shape', async () => {
+    const msgs: any[] = [{ role: 'user', content: 'ANCHOR ' + big(200) }];
+    for (let i = 0; i < 60; i++) {
+      msgs.push({ role: 'assistant', content: `turn ${i}: ` + big(4000) });
+      msgs.push(
+        i % 3 === 0
+          ? { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't' + i, content: 'RES\n' + big(90_000) }] }
+          : { role: 'user', content: `reply ${i}: ` + big(2000) },
+      );
+    }
+    const { body: out, info } = await transformRequest(
+      enc({ model: 'claude-opus-5', system: [{ type: 'text', text: 'SLAB\n' + big(50_000) }], messages: msgs }),
+    );
+
+    const actual = wireImages(dec(out).messages);
+    expect(info.wireImages).toBe(actual);
+    // The whole point: we rendered materially more than we shipped.
+    expect(info.imageCount!).toBeGreaterThan(actual);
+    expect(actual).toBeLessThanOrEqual(ANTHROPIC_MAX_IMAGES);
+  });
+
+  it('agrees with the render count when nothing is absorbed', async () => {
+    const { body: out, info } = await transformRequest(
+      enc({
+        model: 'claude-3-5-sonnet',
+        system: [{ type: 'text', text: 'SLAB\n' + big(30_000) }],
+        messages: [clientImages(2), { role: 'user', content: 'hi' }],
+      }),
+    );
+    expect(info.wireImages).toBe(wireImages(dec(out).messages));
+    expect(info.wireImages).toBe((info.imageCount ?? 0) + (info.nativeImages ?? 0));
+  });
+});
