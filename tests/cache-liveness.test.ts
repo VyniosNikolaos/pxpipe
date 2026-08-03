@@ -15,6 +15,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   markCacheDead,
+  noteCacheOutcome,
+  noteHistoryRequest,
   peekSessionState,
   resetSessionState,
   responseLeftNoCache,
@@ -72,3 +74,94 @@ describe('markCacheDead — session bookkeeping', () => {
     expect(peekSessionState('bbbb2222')).toBeUndefined();
   });
 });
+
+describe('cold detection uses the provider\'s accounting, not the wall clock', () => {
+  beforeEach(() => resetSessionState());
+
+  const MIN = 60_000;
+  const KEY = 'sess1234';
+  // Never 0: lastSeenMs=0 is the store's "never seen" sentinel, so a turn at
+  // epoch 0 would read back as unknown and the horizon could not fire.
+  const T0 = 1_700_000_000_000;
+
+  /** One turn: transform (advances the clock), then the response's cache numbers. */
+  function turn(atMs: number, read: number, create: number) {
+    const state = noteHistoryRequest(KEY, atMs);
+    noteCacheOutcome(KEY, read, create);
+    return state;
+  }
+
+  it('keeps a session warm across a gap the provider proved it survives', () => {
+    // Measured: 66% of gaps past 5.5 minutes still cache-read, so the old
+    // 5-minute threshold called live caches dead most of the time it fired.
+    turn(T0, 100_000, 0);
+    expect(noteHistoryRequest(KEY, T0 + 10 * MIN).cold).toBe(false);
+  });
+
+  it('does not repack on top of a cache the previous turn just paid to write', () => {
+    // The production chain this fixes: three repacks in one hour on ~10-minute
+    // gaps, each preceded by a turn with read=0 and create=60-98k. The clock saw
+    // "no read, long gap" and re-cut; the create said a cache existed.
+    turn(T0, 0, 66_119);
+    expect(noteHistoryRequest(KEY, T0 + 10 * MIN).cold).toBe(false);
+  });
+
+  it('stays warm when the counters were ALWAYS zero — that is no cache, not a dead one', () => {
+    // A request carrying no cache_control marker reports both counters zero for
+    // its whole life. Reading that as "the cache died" would repack the grid on
+    // every single turn, forever, to reclaim a cache that never existed. The
+    // append-only e2e tests caught exactly this.
+    turn(T0, 0, 0);
+    turn(T0 + MIN, 0, 0);
+    expect(noteHistoryRequest(KEY, T0 + 2 * MIN).cold).toBe(false);
+  });
+
+  it('goes cold once a cache existed and then stopped appearing', () => {
+    // This is the real "dead cache": something was there, now nothing is, so
+    // re-cutting the grid costs nothing and reclaims image tokens.
+    turn(T0, 120_000, 0);   // a cache existed
+    turn(T0 + MIN, 0, 0);   // and is gone
+    expect(noteHistoryRequest(KEY, T0 + 2 * MIN).cold).toBe(true);
+  });
+
+  it('goes cold after a rejection regardless of the clock', () => {
+    turn(T0, 100_000, 0);
+    markCacheDead(KEY);
+    expect(noteHistoryRequest(KEY, T0 + 1_000).cold).toBe(true);
+  });
+
+  it('consumes the rejection: the turn after the repack is warm again', () => {
+    turn(T0, 100_000, 0);
+    markCacheDead(KEY);
+    expect(noteHistoryRequest(KEY, T0 + 1_000).cold).toBe(true);
+    noteCacheOutcome(KEY, 0, 50_000); // the repack wrote a fresh cache
+    expect(noteHistoryRequest(KEY, T0 + 2_000).cold).toBe(false);
+  });
+
+  it('falls back to an hour horizon only when the server never answered', () => {
+    // No noteCacheOutcome at all — e.g. a response whose usage never arrived.
+    noteHistoryRequest(KEY, T0);
+    expect(noteHistoryRequest(KEY, T0 + 30 * MIN).cold).toBe(false); // inside the horizon
+    resetSessionState();
+    noteHistoryRequest(KEY, T0);
+    expect(noteHistoryRequest(KEY, T0 + 90 * MIN).cold).toBe(true); // past it
+  });
+
+  it('treats a never-seen session as warm', () => {
+    // Unknown must never authorize a repack: at worst we keep paying the old
+    // image count, we never nuke a live cache on a guess.
+    expect(noteHistoryRequest('brandnew1', 0).cold).toBe(false);
+  });
+
+  it('ignores outcomes for sessions it never transformed', () => {
+    noteCacheOutcome('ghost123', 0, 0);
+    expect(peekSessionState('ghost123')).toBeUndefined();
+  });
+
+  it('lets a proven-dead cache go cold even inside the horizon', () => {
+    turn(T0, 100_000, 0);      // warm
+    turn(T0 + MIN, 0, 0);      // provider says: nothing cached anymore
+    expect(noteHistoryRequest(KEY, T0 + 2 * MIN).cold).toBe(true);
+  });
+});
+

@@ -6,18 +6,31 @@
  * The history grid is append-only: chunk N's pixels are a pure function of its
  * message range, so old chunks stay byte-identical as the conversation grows and
  * ride Anthropic's prompt cache as `cache_read` forever. That freeze is worth a
- * lot — but only while a cache actually exists. Two situations end it:
+ * lot — but only while a cache actually exists. Where there is none, the freeze
+ * protects nothing and the grid is free to be re-cut for *density* instead:
+ * {@link HistoryCollapseOptions.packFill} raises the freeze step until the pages
+ * are nearly full, which roughly halves image tokens on long sessions of short
+ * turns (#161: 317 images at 43% fill).
  *
- *  1. **Idle gap.** Anthropic's ephemeral prefix cache lives {@link CACHE_TTL_SEC}
- *     seconds past the last hit. Resume a session the next morning and every
- *     block is `cache_create` again no matter what we send.
- *  2. **A rejected request.** An oversized request (opaque `500`, see
- *     {@link ANTHROPIC_MAX_IMAGES}) never populated a cache entry at all.
+ * ## How we know whether a cache exists
  *
- * In both cases the append-only freeze protects nothing, and the grid is free to
- * be re-cut for *density* instead: {@link HistoryCollapseOptions.packFill} raises
- * the freeze step until the pages are nearly full, which roughly halves image
- * tokens on long sessions of short turns (#161: 317 images at 43% fill).
+ * The provider tells us, and that beats inferring it. {@link noteCacheOutcome}
+ * feeds each response's accounting back in: a `cache_read` proves the prefix was
+ * live, a `cache_create` proves one was just written. Only when both are zero is
+ * there nothing to lose by re-cutting.
+ *
+ * This module used to decide from the wall clock alone, treating any gap past the
+ * ephemeral 5-minute TTL as cold. That was wrong most of the times it fired —
+ * measured over 143 gaps on a production host, the cache was still warm in 66% of
+ * gaps past 5.5 minutes, 40% past 15 minutes, 13% past an hour. Claude Code marks
+ * some blocks with the 1-hour TTL, so the short constant never described this
+ * traffic. The worst case was a session repacked three times in one hour on
+ * ~10-minute gaps, each repack re-keying the whole prefix — and each preceded by a
+ * turn that had just *written* a cache, which the clock could not see.
+ *
+ * The clock survives only as a backstop for responses whose accounting never
+ * arrived: {@link COLD_HORIZON_MS}. And a rejected request still marks the session
+ * dead outright ({@link markCacheDead}) — a 413/5xx never populated anything.
  *
  * ## Why the step is sticky
  *
@@ -35,8 +48,6 @@
  * on a guess. The state re-arms itself on the first idle gap after the restart.
  */
 
-import { CACHE_TTL_SEC } from './baseline.js';
-
 /** Sessions tracked before the oldest is evicted. One small record each. */
 const SESSIONS_MAX = 512;
 
@@ -48,6 +59,21 @@ const SESSIONS_MAX = 512;
  */
 const COLD_GRACE_MS = 30_000;
 
+/**
+ * Idle gap past which we treat an unobserved cache as gone.
+ *
+ * Not the ephemeral-tier TTL (`CACHE_TTL_SEC`, 5 minutes). Using that here declared sessions cold while their caches were
+ * demonstrably alive: 66% of gaps past 5.5 minutes still cache-read, 40% past
+ * 15 minutes, 13% past an hour (143 gaps, one production host). Claude Code marks
+ * some blocks with the 1-hour TTL, so the short constant never described this
+ * traffic.
+ *
+ * An hour plus the grace is where the evidence turns: past it, warmth is the
+ * exception. This is only a backstop anyway — {@link noteCacheOutcome} answers
+ * from the provider's own accounting whenever a response has been seen.
+ */
+const COLD_HORIZON_MS = 3_600_000 + COLD_GRACE_MS;
+
 interface SessionRecord {
   /** Wall-clock ms of the last request we saw for this session. */
   lastSeenMs: number;
@@ -55,6 +81,20 @@ interface SessionRecord {
   freezeStep: number;
   /** Set when a request for this session failed in a way that leaves no cache. */
   cacheDead: boolean;
+  /**
+   * Did the provider's own accounting show a cache for this session on the last
+   * response — either read from it, or written to it? `undefined` = not observed
+   * yet. This is the server's answer to a question the clock can only guess at.
+   */
+  lastCacheAlive?: boolean;
+  /**
+   * Has this session EVER shown a cache? Absence of caching is not the same fact
+   * as a cache that died: a request carrying no `cache_control` marker reports
+   * both counters zero forever, and repacking such a session every turn would
+   * re-cut the grid over and over for a cache that never existed. Only a session
+   * that once had one, and then lost it, has provably free room to re-cut.
+   */
+  everCacheAlive?: boolean;
 }
 
 const sessions = new Map<string, SessionRecord>();
@@ -102,11 +142,55 @@ export function noteHistoryRequest(
   const rec = touch(sessionKey);
   const known = rec.lastSeenMs > 0;
   const idleMs = nowMs - rec.lastSeenMs;
-  const expired = known && idleMs > CACHE_TTL_SEC * 1000 + COLD_GRACE_MS;
-  const cold = rec.cacheDead || expired;
+
+  // Server truth beats the clock. If the provider's accounting showed a cache on
+  // the last response — read from OR written to — one exists now, and re-cutting
+  // the grid would throw it away.
+  //
+  // The clock alone was wrong most of the time it mattered. Measured over 143
+  // gaps on a production host: past a 5.5-minute gap the cache was still warm in
+  // 66% of cases, past 15 minutes in 40%, past an hour in 13%. One session was
+  // repacked three times in an hour on ~10-minute gaps, each time re-keying the
+  // whole prefix — and each of those turns had just WRITTEN a cache
+  // (create 60-98k, read 0), which the clock could not see and this can.
+  const serverSaysAlive = rec.lastCacheAlive === true;
+  // "Gone" requires that one existed. A session whose counters were always zero
+  // is not a dead cache, it is a session that never had one — repacking it every
+  // turn would churn the grid forever for nothing to reclaim.
+  const serverSaysGone = rec.lastCacheAlive === false && rec.everCacheAlive === true;
+
+  // Backstop for the case the server cannot answer: no observation yet, or an
+  // observation old enough that warmth is empirically rare (13% past an hour).
+  const beyondHorizon = known && idleMs > COLD_HORIZON_MS;
+
+  const cold = rec.cacheDead || (!serverSaysAlive && (serverSaysGone || beyondHorizon));
   rec.lastSeenMs = nowMs;
   rec.cacheDead = false; // consumed: this request gets the repack
   return { cold, minFreezeStep: rec.freezeStep };
+}
+
+/**
+ * Feed the provider's cache accounting back in, once per response.
+ *
+ * `read > 0` proves the prefix was live. `create > 0` proves one was just
+ * written, which is the case the wall clock got wrong: a turn that paid to build
+ * a cache looks identical to a turn that found none, and repacking on top of it
+ * discards the thing just paid for.
+ *
+ * Both zero means nothing is cached for this session, so a repack costs nothing
+ * — that is the only situation where coarsening the grid is free.
+ */
+export function noteCacheOutcome(
+  sessionKey: string | undefined,
+  cacheReadTokens: number | undefined,
+  cacheCreateTokens: number | undefined,
+): void {
+  if (!sessionKey) return;
+  const rec = sessions.get(sessionKey);
+  if (!rec) return; // never transformed under this key — nothing to attribute
+  const alive = (cacheReadTokens ?? 0) > 0 || (cacheCreateTokens ?? 0) > 0;
+  rec.lastCacheAlive = alive;
+  if (alive) rec.everCacheAlive = true;
 }
 
 /**
