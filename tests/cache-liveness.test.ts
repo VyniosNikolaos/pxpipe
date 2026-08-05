@@ -27,8 +27,20 @@ describe('responseLeftNoCache — outcomes that leave no cache entry', () => {
     expect(responseLeftNoCache(413)).toBe(true);
   });
 
-  it('treats every 5xx as cache-ending — the over-cap image count returns an opaque 500', () => {
-    for (const s of [500, 502, 503, 529]) expect(responseLeftNoCache(s)).toBe(true);
+  it('does NOT treat a transient 5xx as cache-ending', () => {
+    // Production settled this. Of 20871 requests on one host the 5xx population
+    // was 177x 529 overloaded, 2x 500, 1x 503 — and 129 of 250 repacks fired
+    // directly after one of them. A 529 means the provider declined to process
+    // the request; the prefix cache it never touched is still there, and the
+    // repack threw it away for nothing.
+    for (const s of [500, 502, 503, 504, 529]) expect(responseLeftNoCache(s), String(s)).toBe(false);
+  });
+
+  it('needs no error signal for a cache that really died', () => {
+    // noteCacheOutcome sees the next response report neither a read nor a write.
+    // That is accurate and free, which is why the blanket 5xx rule could go.
+    expect(responseLeftNoCache(529)).toBe(false);
+    expect(responseLeftNoCache(413)).toBe(true);
   });
 
   it('reads a 400 body for the provider’s several spellings of "too long"', () => {

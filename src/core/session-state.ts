@@ -30,7 +30,8 @@
  *
  * The clock survives only as a backstop for responses whose accounting never
  * arrived: {@link COLD_HORIZON_MS}. And a rejected request still marks the session
- * dead outright ({@link markCacheDead}) — a 413/5xx never populated anything.
+ * dead outright ({@link markCacheDead}) — but only a 413 or a too-long 400, not
+ * a transient 5xx: see {@link responseLeftNoCache}.
  *
  * ## Why the step is sticky
  *
@@ -223,20 +224,24 @@ export function markCacheDead(sessionKey: string | undefined): void {
  * outcomes mean it never got that far, so the frozen grid we were protecting
  * protects nothing and the next turn may re-cut for density:
  *
- *  - `413` — payload rejected outright;
+ *  - `413` — the payload was rejected outright;
  *  - `400` whose body says the prompt is too long (Anthropic's wording varies:
- *    `prompt is too long`, `prompt_too_long`, `request_too_large`);
- *  - `5xx` — includes the opaque `500` an over-cap image count produces.
+ *    `prompt is too long`, `prompt_too_long`, `request_too_large`).
  *
- * Every other 4xx (bad key, rate limit, overloaded) says nothing about the
- * cache: the prefix may well still be live, so we leave the session warm and
- * keep the cheap append-only path. Guessing "cold" there would re-cut a live
- * grid and burn the whole prefix as `cache_create` — the exact failure this
- * module exists to avoid.
+ * NOT any 5xx, which is what this used to say. Production disagreed: of 20871
+ * requests on one host the 5xx population was 177 × `529 overloaded`, 2 × `500`
+ * and 1 × `503` — and 129 of 250 repacks fired directly after one of them. A 529
+ * means the provider declined to process the request; the prefix cache it never
+ * touched is still there, and re-cutting the grid threw it away for nothing.
+ *
+ * Nor any other 4xx. A bad key or a rate limit says nothing about the cache.
+ *
+ * A cache that genuinely died needs no error to be noticed: {@link
+ * noteCacheOutcome} sees the next response report neither a read nor a write, and
+ * that is both accurate and free.
  */
 export function responseLeftNoCache(status: number, errorBody?: string): boolean {
   if (status === 413) return true;
-  if (status >= 500) return true;
   if (status === 400 && errorBody) {
     return /prompt[\s_-]*(is\s*)?too[\s_-]*long|request[\s_-]*too[\s_-]*large|too many (images|tokens)/i
       .test(errorBody);
